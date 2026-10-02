@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Rantai Makanan AR</title>
+<style>
+:root{--bg:#10201a;--ink:#f4f7ee;--pad:#f2c94c;--hijau:#6fcf97}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Trebuchet MS","Segoe UI",sans-serif;overflow:hidden;touch-action:none}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+video{display:none}
+.layer{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:24px;background:rgba(16,32,26,.93)}
+.layer h1{margin:0;font-size:clamp(24px,6vw,40px)}
+.layer p{margin:0;max-width:34ch;line-height:1.5;opacity:.9}
+button{font:inherit;font-weight:700;padding:14px 26px;border:0;border-radius:14px;background:var(--pad);color:#26200a;cursor:pointer}
+button.alt{background:transparent;color:var(--ink);border:2px solid var(--hijau)}
+button:focus-visible{outline:3px solid #fff;outline-offset:3px}
+#win{display:none}
+#stat{font-size:14px;opacity:.8;min-height:1.2em}
+</style>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+
+<div id="menu" class="layer">
+  <h1>🌾 Rantai Makanan</h1>
+  <p id="judul">Cubit gambar, lalu pasangkan ke urutan yang benar: siapa dimakan siapa.</p>
+  <button id="bKamera">Main dengan kamera (cubit jari)</button>
+  <button id="bSentuh" class="alt">Main dengan sentuh layar</button>
+  <div id="stat"></div>
+</div>
+
+<div id="win" class="layer">
+  <h1>🎉 Level selesai!</h1>
+  <p id="winTxt"></p>
+  <button id="bUlang">Main lagi</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+/* ===== DATA LEVEL: tambah ekosistem baru cukup dengan menambah objek di sini ===== */
+const LEVELS = [
+  { nama: 'Ekosistem Sawah', rantai: [
+    { e: '🌾', n: 'Padi',   r: 'Produsen' },
+    { e: '🐛', n: 'Wereng', r: 'Konsumen I' },
+    { e: '🐸', n: 'Katak',  r: 'Konsumen II' },
+    { e: '🐍', n: 'Ular',   r: 'Konsumen III' },
+    { e: '🦅', n: 'Elang',  r: 'Konsumen IV' }
+  ]}
+];
+
+/* ===== SETUP ===== */
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d'), video = $('v');
+let W = 0, H = 0, R = 40, level = 0, cards = [], slots = [], score = 0, msg = '', msgT = 0;
+let camOn = false, hands = null, handLM = null, busy = false, started = false;
+const P = { x: -99, y: -99, down: false, hand: false }; // pointer gabungan (tangan / sentuh)
+let held = null, pinching = false, audio = null;
+
+function resize() {
+  const d = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * d; cv.height = H * d;
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  if (started) layout();
+}
+addEventListener('resize', resize);
+
+function beep(f, dur) {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audio.createOscillator(), g = audio.createGain();
+    o.frequency.value = f; g.gain.value = 0.08;
+    o.connect(g); g.connect(audio.destination);
+    o.start(); o.stop(audio.currentTime + dur);
+  } catch (e) {}
+}
+function say(t) { msg = t; msgT = performance.now() + 2200; }
+
+/* ===== LEVEL ===== */
+function layout() {
+  const L = LEVELS[level], n = L.rantai.length;
+  R = Math.max(28, Math.min(W / (n + 1.5) / 1.2, H / 7, 56));
+  const oldPlaced = cards.map(c => c.placed);
+  slots = L.rantai.map((_, i) => ({ i, x: W * (i + 0.5) / n, y: H - R * 2.3, filled: false }));
+  // posisi awal kartu: acak urutan, tersebar di area tengah
+  if (!cards.length) {
+    const order = L.rantai.map((_, i) => i).sort(() => Math.random() - 0.5);
+    cards = order.map((idx, k) => ({
+      idx, e: L.rantai[idx].e, n: L.rantai[idx].n, k, placed: false,
+      x: 0, y: 0, tx: 0, ty: 0, hx: 0, hy: 0, shake: 0
+    }));
+  }
+  cards.forEach(c => {
+    c.hx = W * (c.k + 0.5) / n;
+    c.hy = H * 0.26 + ((c.k % 2) ? R * 1.6 : 0) + (c.k * 37 % 40);
+    if (c.placed) { c.tx = slots[c.idx].x; c.ty = slots[c.idx].y; slots[c.idx].filled = true; }
+    else { c.tx = c.hx; c.ty = c.hy; }
+    if (!c.x) { c.x = c.tx; c.y = c.ty; }
+  });
+}
+function startLevel() {
+  cards = []; score = 0; held = null;
+  $('win').style.display = 'none';
+  layout();
+  say('Cubit gambar, lalu letakkan di urutan yang benar');
+}
+
+/* ===== INTERAKSI ===== */
+function grab(x, y) {
+  let best = null, bd = R * 1.4;
+  cards.forEach(c => {
+    if (c.placed) return;
+    const d = Math.hypot(c.x - x, c.y - y);
+    if (d < bd) { bd = d; best = c; }
+  });
+  held = best;
+  if (held) beep(520, 0.05);
+}
+function drop(x, y) {
+  if (!held) return;
+  const c = held; held = null;
+  let s = null, bd = R * 1.5;
+  slots.forEach(o => { const d = Math.hypot(o.x - x, o.y - y); if (d < bd) { bd = d; s = o; } });
+  const L = LEVELS[level].rantai;
+  if (s && !s.filled && s.i === c.idx) {
+    c.placed = true; s.filled = true; c.tx = s.x; c.ty = s.y; score++;
+    beep(760, 0.12);
+    say(c.idx === 0 ? 'Benar! Padi adalah produsen' : `Benar! ${c.n} memakan ${L[c.idx - 1].n}`);
+    if (score === L.length) setTimeout(() => {
+      $('winTxt').textContent = 'Kamu menyusun rantai makanan ' + LEVELS[level].nama + ' dengan benar.';
+      $('win').style.display = 'flex';
+    }, 900);
+  } else if (s) {
+    c.tx = c.hx; c.ty = c.hy; c.shake = 12; beep(200, 0.2);
+    say('Belum tepat, coba lagi');
+  } else { c.tx = c.hx; c.ty = c.hy; }
+}
+// sentuh / mouse
+cv.addEventListener('pointerdown', e => { if (P.hand) return; P.x = e.clientX; P.y = e.clientY; P.down = true; grab(P.x, P.y); });
+cv.addEventListener('pointermove', e => { if (P.hand) return; P.x = e.clientX; P.y = e.clientY; });
+addEventListener('pointerup', () => { if (P.hand) return; P.down = false; drop(P.x, P.y); });
+
+// tangan (MediaPipe): cubit = ujung jempol dan telunjuk berdekatan
+function updateHand() {
+  if (!camOn) return;
+  if (!handLM) { P.hand = false; if (pinching) { pinching = false; drop(P.x, P.y); } return; }
+  P.hand = true;
+  const a = handLM[4], b = handLM[8], w = handLM[0], m = handLM[9];
+  const size = Math.hypot(w.x - m.x, w.y - m.y) || 0.1;
+  const ratio = Math.hypot(a.x - b.x, a.y - b.y) / size;
+  const tx = vx((a.x + b.x) / 2), ty = vy((a.y + b.y) / 2);
+  P.x += (tx - P.x) * 0.45; P.y += (ty - P.y) * 0.45;
+  if (!pinching && ratio < 0.38) { pinching = true; P.down = true; grab(P.x, P.y); }
+  else if (pinching && ratio > 0.62) { pinching = false; P.down = false; drop(P.x, P.y); }
+}
+let vr = { dx: 0, dy: 0, dw: 1, dh: 1 };
+const vx = nx => vr.dx + (1 - nx) * vr.dw;   // dicerminkan
+const vy = ny => vr.dy + ny * vr.dh;
+
+/* ===== GAMBAR ===== */
+const LINKS = [[0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20]];
+function drawBG() {
+  if (camOn && video.videoWidth) {
+    const s = Math.max(W / video.videoWidth, H / video.videoHeight);
+    vr.dw = video.videoWidth * s; vr.dh = video.videoHeight * s;
+    vr.dx = (W - vr.dw) / 2; vr.dy = (H - vr.dh) / 2;
+    ctx.save(); ctx.translate(vr.dx + vr.dw, vr.dy); ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, vr.dw, vr.dh); ctx.restore();
+    ctx.fillStyle = 'rgba(16,32,26,.28)'; ctx.fillRect(0, 0, W, H);
+  } else {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#2d5a3d'); g.addColorStop(0.6, '#4f8a4a'); g.addColorStop(1, '#8a7a3a');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+}
+function drawSlots() {
+  const L = LEVELS[level].rantai;
+  ctx.textAlign = 'center';
+  slots.forEach(s => {
+    ctx.beginPath(); ctx.arc(s.x, s.y, R * 0.95, 0, 7);
+    ctx.fillStyle = s.filled ? 'rgba(111,207,151,.25)' : 'rgba(0,0,0,.35)'; ctx.fill();
+    ctx.setLineDash(s.filled ? [] : [7, 6]); ctx.lineWidth = 3;
+    ctx.strokeStyle = s.filled ? '#6fcf97' : 'rgba(255,255,255,.7)'; ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#fff'; ctx.font = `700 ${Math.max(11, R * 0.3)}px "Trebuchet MS",sans-serif`;
+    ctx.fillText(L[s.i].r, s.x, s.y + R * 1.45);
+    if (s.i < slots.length - 1) {
+      ctx.font = `700 ${R * 0.5}px sans-serif`; ctx.fillStyle = 'rgba(255,255,255,.85)';
+      ctx.fillText('➜', (s.x + slots[s.i + 1].x) / 2, s.y + R * 0.18);
+    }
+  });
+}
+function drawCard(c, t) {
+  const isHeld = held === c;
+  if (isHeld) { c.x = P.x; c.y = P.y; }
+  else {
+    const bob = c.placed ? 0 : Math.sin(t / 600 + c.k) * 6;
+    c.x += (c.tx - c.x) * 0.22; c.y += (c.ty + bob - c.y) * 0.22;
+  }
+  const sh = c.shake > 0 ? Math.sin(c.shake * 2) * 6 : 0; if (c.shake > 0) c.shake -= 0.5;
+  const r = R * (isHeld ? 1.15 : c.placed ? 0.85 : 1), x = c.x + sh;
+  ctx.beginPath(); ctx.arc(x, c.y, r, 0, 7);
+  ctx.fillStyle = c.placed ? '#e8f5e9' : '#fff8dc'; ctx.fill();
+  ctx.lineWidth = isHeld ? 5 : 3; ctx.strokeStyle = isHeld ? '#f2c94c' : c.placed ? '#6fcf97' : '#c9a227'; ctx.stroke();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `${r * 1.0}px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif`;
+  ctx.fillStyle = '#000'; ctx.fillText(c.e, x, c.y + 2);
+  ctx.textBaseline = 'alphabetic';
+  if (!c.placed) {
+    ctx.font = `700 ${Math.max(12, R * 0.34)}px "Trebuchet MS",sans-serif`;
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.strokeText(c.n, x, c.y + r + R * 0.45);
+    ctx.fillStyle = '#fff'; ctx.fillText(c.n, x, c.y + r + R * 0.45);
+  }
+}
+function drawHand() {
+  if (!handLM) return;
+  ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(111,207,151,.8)';
+  LINKS.forEach(l => { ctx.beginPath(); l.forEach((i, k) => { const p = handLM[i]; k ? ctx.lineTo(vx(p.x), vy(p.y)) : ctx.moveTo(vx(p.x), vy(p.y)); }); ctx.stroke(); });
+}
+function drawCursor() {
+  if (P.x < 0) return;
+  ctx.beginPath(); ctx.arc(P.x, P.y, P.down ? 12 : 18, 0, 7);
+  ctx.lineWidth = 3; ctx.strokeStyle = '#f2c94c'; ctx.stroke();
+  if (P.down) { ctx.fillStyle = 'rgba(242,201,76,.5)'; ctx.fill(); }
+}
+function drawHUD(t) {
+  ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(0,0,0,.55)';
+  ctx.beginPath(); ctx.roundRect(12, 12 + 0, 190, 54, 14); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = '700 14px "Trebuchet MS",sans-serif';
+  ctx.fillText(LEVELS[level].nama, 24, 34);
+  ctx.fillStyle = '#f2c94c'; ctx.font = '700 20px "Trebuchet MS",sans-serif';
+  ctx.fillText(`${score} / ${slots.length}`, 24, 57);
+  if (t < msgT && msg) {
+    ctx.textAlign = 'center'; ctx.font = '700 16px "Trebuchet MS",sans-serif';
+    const w = ctx.measureText(msg).width + 36;
+    ctx.fillStyle = 'rgba(0,0,0,.65)'; ctx.beginPath(); ctx.roundRect(W / 2 - w / 2, H - R * 4.6, w, 36, 18); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillText(msg, W / 2, H - R * 4.6 + 24);
+  }
+}
+function frame(t) {
+  ctx.clearRect(0, 0, W, H);
+  drawBG();
+  if (started) {
+    updateHand(); drawSlots();
+    cards.filter(c => c !== held).forEach(c => drawCard(c, t));
+    if (held) drawCard(held, t);
+    drawHand(); drawCursor(); drawHUD(t);
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ===== KAMERA & MEDIAPIPE ===== */
+async function detect() {
+  if (camOn && !busy && video.readyState >= 2) {
+    busy = true;
+    try { await hands.send({ image: video }); } catch (e) {}
+    busy = false;
+  }
+  requestAnimationFrame(detect);
+}
+async function startCam() {
+  $('stat').textContent = 'Menyalakan kamera dan memuat model tangan…';
+  try {
+    if (typeof Hands === 'undefined') throw new Error('Pustaka MediaPipe tidak termuat (cek internet)');
+    const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640, height: 480 }, audio: false });
+    video.srcObject = s; await video.play();
+    hands = new Hands({ locateFile: f => 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/' + f });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+    hands.onResults(r => { handLM = (r.multiHandLandmarks && r.multiHandLandmarks[0]) || null; });
+    camOn = true; detect(); begin();
+  } catch (e) {
+    $('stat').textContent = 'Kamera belum bisa dipakai: ' + e.message + '. Coba mode sentuh.';
+  }
+}
+function begin() { started = true; $('menu').style.display = 'none'; resize(); startLevel(); }
+
+$('bKamera').onclick = startCam;
+$('bSentuh').onclick = begin;
+$('bUlang').onclick = startLevel;
+resize(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
